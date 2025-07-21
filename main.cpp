@@ -6,12 +6,12 @@
 #include <vector>
 #include <mutex>
 #include <string>
-#include <cwchar> 
-
+#include <cwchar>
+#include <chrono>
 
 #pragma comment(lib, "winhttp.lib")
 
-const int NUM_THREADS = 4;
+int NUM_THREADS = 4; // Can be overridden via CLI
 
 struct Chunk {
     int id;
@@ -53,7 +53,8 @@ void download_chunk(Chunk& chunk) {
     WinHttpCloseHandle(hSession);
 
     std::lock_guard<std::mutex> lock(cout_mutex);
-    std::cout << "Chunk " << chunk.id << " downloaded: " << chunk.data.size() << " bytes.\n";
+    std::cout << " Chunk " << chunk.id << " downloaded: "
+              << chunk.start << "-" << chunk.end << " (" << chunk.data.size() << " bytes)\n";
 }
 
 DWORD get_content_length(const std::wstring& host, const std::wstring& path) {
@@ -68,18 +69,12 @@ DWORD get_content_length(const std::wstring& host, const std::wstring& path) {
                        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     WinHttpReceiveResponse(hRequest, NULL);
 
-    DWORD size = sizeof(length);
-    WCHAR szContentLength[32];
+    WCHAR szContentLength[32] = {0};
     DWORD dwSize = sizeof(szContentLength);
-    WinHttpQueryHeaders(hRequest,
-        WINHTTP_QUERY_CONTENT_LENGTH,
-        NULL,
-        &szContentLength,
-        &dwSize,
-        WINHTTP_NO_HEADER_INDEX);
-
-    length = _wtoi(szContentLength); 
-
+    if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH, NULL,
+                            &szContentLength, &dwSize, WINHTTP_NO_HEADER_INDEX)) {
+        length = _wtoi(szContentLength);
+    }
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
@@ -94,16 +89,34 @@ void join_chunks(const std::vector<Chunk>& chunks, const std::string& filename) 
         out.write(chunk.data.data(), chunk.data.size());
     }
     out.close();
-    std::cout << "Download completed: " << filename << "\n";
+    std::cout << "Final file written: " << filename << "\n";
 }
 
-int main() {
-    std::string url = "http://speedtest.tele2.net/1MB.zip";  
+// Optional: Windows command to hash a file
+void show_file_hash(const std::string& filename) {
+    std::string command = "certutil -hashfile \"" + filename + "\" SHA256";
+    std::cout << "To verify file integrity, run:\n" << command << "\n";
+}
+
+int main(int argc, char* argv[]) {
+    if (argc > 1) {
+        NUM_THREADS = std::stoi(argv[1]);
+        if (NUM_THREADS <= 0) NUM_THREADS = 1;
+    }
+
+    std::string url = "http://speedtest.tele2.net/1MB.zip";
     std::string host = "speedtest.tele2.net";
     std::string path = "/1MB.zip";
 
+    std::cout << " Downloading: " << url << " using " << NUM_THREADS << " threads\n";
+
     DWORD totalSize = get_content_length(std::wstring(host.begin(), host.end()), std::wstring(path.begin(), path.end()));
-    std::cout << "Total size: " << totalSize << " bytes\n";
+    if (totalSize == 0) {
+        std::cerr << " Could not get content length.\n";
+        return 1;
+    }
+
+    std::cout << " Total file size: " << totalSize << " bytes\n";
 
     DWORD chunkSize = totalSize / NUM_THREADS;
     std::vector<Chunk> chunks(NUM_THREADS);
@@ -116,13 +129,21 @@ int main() {
         chunks[i].path = path;
     }
 
+    auto start = std::chrono::high_resolution_clock::now();
+
     std::vector<std::thread> threads;
     for (auto& chunk : chunks) {
         threads.emplace_back(download_chunk, std::ref(chunk));
     }
-
     for (auto& t : threads) t.join();
 
-    join_chunks(chunks, "output_file.zip");
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Total download time: " << elapsed.count() << " seconds\n";
+
+    std::string filename = "output_file.zip";
+    join_chunks(chunks, filename);
+    show_file_hash(filename);
+
     return 0;
 }
